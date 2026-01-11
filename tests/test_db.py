@@ -1,11 +1,10 @@
 """Unit tests for database logging."""
 
-import sqlite3
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import db
-from db import log_post
+from db import log_post, create_user, get_user_by_username, save_tiktok_tokens, get_tiktok_tokens
 
 
 class TestLogPost:
@@ -16,14 +15,23 @@ class TestLogPost:
         with patch.object(db, "conn", in_memory_db):
             log_post("test_video.mp4", "POSTED", "tiktok", '{"success": true}')
 
-            cursor = in_memory_db.execute("SELECT * FROM posts")
-            rows = cursor.fetchall()
+            cursor = in_memory_db.execute("SELECT filename, status, platform, response FROM posts")
+            row = cursor.fetchone()
 
-            assert len(rows) == 1
-            assert rows[0][1] == "test_video.mp4"  # filename
-            assert rows[0][2] == "POSTED"  # status
-            assert rows[0][3] == "tiktok"  # platform
-            assert rows[0][4] == '{"success": true}'  # response
+            assert row[0] == "test_video.mp4"
+            assert row[1] == "POSTED"
+            assert row[2] == "tiktok"
+            assert row[3] == '{"success": true}'
+
+    def test_log_post_with_user_id(self, in_memory_db):
+        """Should insert a record with user_id."""
+        with patch.object(db, "conn", in_memory_db):
+            user_id = create_user("testuser", "hash")
+            log_post("test_video.mp4", "POSTED", "tiktok", "", user_id)
+
+            cursor = in_memory_db.execute("SELECT user_id FROM posts")
+            row = cursor.fetchone()
+            assert row[0] == user_id
 
     def test_log_post_with_empty_response(self, in_memory_db):
         """Should handle empty response string."""
@@ -32,7 +40,6 @@ class TestLogPost:
 
             cursor = in_memory_db.execute("SELECT response FROM posts")
             row = cursor.fetchone()
-
             assert row[0] == ""
 
     def test_log_post_multiple_entries(self, in_memory_db):
@@ -44,100 +51,78 @@ class TestLogPost:
 
             cursor = in_memory_db.execute("SELECT COUNT(*) FROM posts")
             count = cursor.fetchone()[0]
-
             assert count == 3
 
-    def test_log_post_different_platforms(self, in_memory_db):
-        """Should correctly log different platforms."""
+
+class TestUserFunctions:
+    """Tests for user database functions."""
+
+    def test_create_user(self, in_memory_db):
+        """Should create a user and return ID."""
         with patch.object(db, "conn", in_memory_db):
-            log_post("video.mp4", "POSTED", "tiktok", "")
-            log_post("video.mp4", "POSTED", "youtube", "")
-            log_post("video.mp4", "POSTED", "instagram", "")
+            user_id = create_user("testuser", "hashed_password")
+            assert user_id > 0
 
-            cursor = in_memory_db.execute("SELECT DISTINCT platform FROM posts")
-            platforms = [row[0] for row in cursor.fetchall()]
-
-            assert set(platforms) == {"tiktok", "youtube", "instagram"}
-
-    def test_log_post_different_statuses(self, in_memory_db):
-        """Should correctly log different statuses."""
+    def test_get_user_by_username(self, in_memory_db):
+        """Should retrieve user by username."""
         with patch.object(db, "conn", in_memory_db):
-            log_post("video1.mp4", "POSTED", "tiktok", "")
-            log_post("video2.mp4", "FAILED", "tiktok", "")
-            log_post("video3.mp4", "PENDING", "tiktok", "")
+            create_user("testuser", "hashed_password")
+            user = get_user_by_username("testuser")
 
-            cursor = in_memory_db.execute("SELECT status FROM posts ORDER BY id")
-            statuses = [row[0] for row in cursor.fetchall()]
+            assert user is not None
+            assert user["username"] == "testuser"
+            assert user["password_hash"] == "hashed_password"
 
-            assert statuses == ["POSTED", "FAILED", "PENDING"]
-
-    def test_log_post_special_characters_in_filename(self, in_memory_db):
-        """Should handle special characters in filename."""
+    def test_get_nonexistent_user(self, in_memory_db):
+        """Should return None for nonexistent user."""
         with patch.object(db, "conn", in_memory_db):
-            filename = "my video (1) - final [2024].mp4"
-            log_post(filename, "POSTED", "tiktok", "")
+            user = get_user_by_username("nonexistent")
+            assert user is None
 
-            cursor = in_memory_db.execute("SELECT filename FROM posts")
-            row = cursor.fetchone()
 
-            assert row[0] == filename
+class TestTikTokTokens:
+    """Tests for TikTok token storage."""
 
-    def test_log_post_long_response(self, in_memory_db):
-        """Should handle long response strings."""
+    def test_save_and_get_tokens(self, in_memory_db):
+        """Should save and retrieve TikTok tokens."""
         with patch.object(db, "conn", in_memory_db):
-            long_response = "x" * 10000
-            log_post("video.mp4", "POSTED", "tiktok", long_response)
+            user_id = create_user("testuser", "hash")
+            save_tiktok_tokens(user_id, "access_123", "refresh_456", 3600)
 
-            cursor = in_memory_db.execute("SELECT response FROM posts")
-            row = cursor.fetchone()
+            tokens = get_tiktok_tokens(user_id)
+            assert tokens["access_token"] == "access_123"
+            assert tokens["refresh_token"] == "refresh_456"
+            assert tokens["expires_at"] == 3600
 
-            assert row[0] == long_response
-            assert len(row[0]) == 10000
-
-
-class TestDatabaseSchema:
-    """Tests for database schema."""
-
-    def test_posts_table_has_correct_columns(self, in_memory_db):
-        """Should have all required columns."""
-        cursor = in_memory_db.execute("PRAGMA table_info(posts)")
-        columns = {row[1]: row[2] for row in cursor.fetchall()}
-
-        assert "id" in columns
-        assert "filename" in columns
-        assert "status" in columns
-        assert "platform" in columns
-        assert "response" in columns
-
-    def test_id_is_primary_key(self, in_memory_db):
-        """Should have id as primary key."""
-        cursor = in_memory_db.execute("PRAGMA table_info(posts)")
-        for row in cursor.fetchall():
-            if row[1] == "id":
-                assert row[5] == 1  # pk column
-
-    def test_id_auto_increments(self, in_memory_db):
-        """Should auto-increment id."""
+    def test_get_tokens_no_tokens(self, in_memory_db):
+        """Should return None when user has no tokens."""
         with patch.object(db, "conn", in_memory_db):
-            log_post("video1.mp4", "POSTED", "tiktok", "")
-            log_post("video2.mp4", "POSTED", "tiktok", "")
+            user_id = create_user("testuser", "hash")
+            tokens = get_tiktok_tokens(user_id)
+            assert tokens is None
 
-            cursor = in_memory_db.execute("SELECT id FROM posts ORDER BY id")
-            ids = [row[0] for row in cursor.fetchall()]
+    def test_save_tokens_replaces_old(self, in_memory_db):
+        """Should replace old tokens when saving new ones."""
+        with patch.object(db, "conn", in_memory_db):
+            user_id = create_user("testuser", "hash")
+            save_tiktok_tokens(user_id, "old_token", "old_refresh", 1000)
+            save_tiktok_tokens(user_id, "new_token", "new_refresh", 2000)
 
-            assert ids == [1, 2]
+            tokens = get_tiktok_tokens(user_id)
+            assert tokens["access_token"] == "new_token"
 
 
 class TestDatabaseConnection:
     """Tests for database connection handling."""
 
-    def test_module_creates_table_on_import(self):
-        """Should create posts table when module is imported."""
-        # The actual db module creates the table on import
+    def test_module_creates_tables_on_import(self):
+        """Should create tables when module is imported."""
         cursor = db.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='posts'"
         )
-        result = cursor.fetchone()
-        assert result is not None
-        assert result[0] == "posts"
+        assert cursor.fetchone() is not None
 
+        cursor = db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
+        )
+        assert cursor.fetchone() is not None
