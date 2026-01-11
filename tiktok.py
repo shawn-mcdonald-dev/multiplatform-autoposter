@@ -1,11 +1,19 @@
 """TikTok Content Posting API integration."""
 
 import os
+import secrets
 import requests
 from typing import Optional
+from urllib.parse import urlencode
 
 TIKTOK_API_BASE = "https://open.tiktokapis.com"
+TIKTOK_AUTH_BASE = "https://www.tiktok.com/v2/auth/authorize"
 CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks for upload
+
+# OAuth configuration from environment
+TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
+TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
+TIKTOK_REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI", "http://localhost:8000/auth/tiktok/callback")
 
 
 class TikTokAPIError(Exception):
@@ -27,15 +35,18 @@ class MissingTokenError(Exception):
         )
 
 
+class MissingOAuthConfigError(Exception):
+    """Exception raised when OAuth configuration is missing."""
+
+    def __init__(self):
+        super().__init__(
+            "TikTok OAuth configuration is incomplete. "
+            "Please set TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET, and TIKTOK_REDIRECT_URI."
+        )
+
+
 def get_access_token() -> str:
-    """Get the TikTok access token from environment.
-
-    Returns:
-        The access token string.
-
-    Raises:
-        MissingTokenError: If the token is not set.
-    """
+    """Get the TikTok access token from environment."""
     token = os.getenv("TIKTOK_ACCESS_TOKEN")
     if not token:
         raise MissingTokenError()
@@ -50,25 +61,86 @@ def _get_auth_headers(token: str) -> dict:
     }
 
 
-def _init_video_upload(token: str, file_size: int) -> dict:
-    """Initialize a video upload with TikTok.
-
-    Args:
-        token: The access token.
-        file_size: Size of the video file in bytes.
+def get_authorization_url() -> tuple[str, str]:
+    """Generate TikTok OAuth authorization URL.
 
     Returns:
-        Dict containing publish_id and upload_url.
+        Tuple of (authorization_url, state) where state is used for CSRF protection.
 
     Raises:
-        TikTokAPIError: If the API returns an error.
+        MissingOAuthConfigError: If OAuth credentials are not configured.
     """
+    if not TIKTOK_CLIENT_KEY or not TIKTOK_REDIRECT_URI:
+        raise MissingOAuthConfigError()
+
+    state = secrets.token_urlsafe(32)
+
+    params = {
+        "client_key": TIKTOK_CLIENT_KEY,
+        "scope": "user.info.basic,video.upload,video.publish",
+        "response_type": "code",
+        "redirect_uri": TIKTOK_REDIRECT_URI,
+        "state": state,
+    }
+
+    auth_url = f"{TIKTOK_AUTH_BASE}/?{urlencode(params)}"
+    return auth_url, state
+
+
+def exchange_code_for_token(code: str) -> dict:
+    """Exchange authorization code for access token.
+
+    Args:
+        code: The authorization code from TikTok callback.
+
+    Returns:
+        Dict containing access_token, refresh_token, expires_in, etc.
+
+    Raises:
+        MissingOAuthConfigError: If OAuth credentials are not configured.
+        TikTokAPIError: If token exchange fails.
+    """
+    if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
+        raise MissingOAuthConfigError()
+
+    url = f"{TIKTOK_API_BASE}/v2/oauth/token/"
+
+    payload = {
+        "client_key": TIKTOK_CLIENT_KEY,
+        "client_secret": TIKTOK_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": TIKTOK_REDIRECT_URI,
+    }
+
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    response = requests.post(url, data=payload, headers=headers)
+    data = response.json()
+
+    if "error" in data or response.status_code != 200:
+        error_msg = data.get("error_description", data.get("message", "Token exchange failed"))
+        raise TikTokAPIError(
+            data.get("error", "token_exchange_failed"),
+            error_msg,
+        )
+
+    return {
+        "access_token": data["access_token"],
+        "refresh_token": data.get("refresh_token"),
+        "expires_in": data.get("expires_in"),
+        "token_type": data.get("token_type"),
+    }
+
+
+def _init_video_upload(token: str, file_size: int) -> dict:
+    """Initialize a video upload with TikTok."""
     url = f"{TIKTOK_API_BASE}/v2/post/publish/video/init/"
 
     payload = {
         "post_info": {
             "title": "Video uploaded via Autoposter",
-            "privacy_level": "SELF_ONLY",  # Safe default - creator can change on TikTok
+            "privacy_level": "SELF_ONLY",
             "disable_duet": False,
             "disable_comment": False,
             "disable_stitch": False,
@@ -95,16 +167,7 @@ def _init_video_upload(token: str, file_size: int) -> dict:
 
 
 def _upload_video_chunks(upload_url: str, file_path: str, file_size: int) -> None:
-    """Upload video file in chunks to TikTok.
-
-    Args:
-        upload_url: The upload URL from init response.
-        file_path: Path to the video file.
-        file_size: Total size of the file.
-
-    Raises:
-        TikTokAPIError: If upload fails.
-    """
+    """Upload video file in chunks to TikTok."""
     with open(file_path, "rb") as f:
         chunk_index = 0
         offset = 0
@@ -132,18 +195,7 @@ def _upload_video_chunks(upload_url: str, file_path: str, file_size: int) -> Non
 
 
 def _check_publish_status(token: str, publish_id: str) -> dict:
-    """Check the status of a video publication.
-
-    Args:
-        token: The access token.
-        publish_id: The publish ID from init response.
-
-    Returns:
-        Dict containing status information.
-
-    Raises:
-        TikTokAPIError: If the API returns an error.
-    """
+    """Check the status of a video publication."""
     url = f"{TIKTOK_API_BASE}/v2/post/publish/status/fetch/"
 
     payload = {"publish_id": publish_id}
@@ -161,17 +213,12 @@ def _check_publish_status(token: str, publish_id: str) -> dict:
     return data["data"]
 
 
-def post_video(file_path: str) -> dict:
+def post_video(file_path: str, access_token: Optional[str] = None) -> dict:
     """Post a video to TikTok.
-
-    This function handles the complete flow:
-    1. Validates the access token exists
-    2. Initializes the upload with TikTok
-    3. Uploads the video file in chunks
-    4. Checks and returns the publication status
 
     Args:
         file_path: Path to the video file to upload.
+        access_token: Optional access token. If not provided, reads from environment.
 
     Returns:
         Dict containing the publication result with status and publish_id.
@@ -181,24 +228,22 @@ def post_video(file_path: str) -> dict:
         TikTokAPIError: If any API call fails.
         FileNotFoundError: If the video file doesn't exist.
     """
-    # Validate token exists
-    token = get_access_token()
+    if access_token is None:
+        token = get_access_token()
+    else:
+        token = access_token
 
-    # Validate file exists
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Video file not found: {file_path}")
 
     file_size = os.path.getsize(file_path)
 
-    # Step 1: Initialize upload
     init_data = _init_video_upload(token, file_size)
     publish_id = init_data["publish_id"]
     upload_url = init_data["upload_url"]
 
-    # Step 2: Upload video chunks
     _upload_video_chunks(upload_url, file_path, file_size)
 
-    # Step 3: Check status
     status_data = _check_publish_status(token, publish_id)
 
     return {
